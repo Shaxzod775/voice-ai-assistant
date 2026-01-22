@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice AI Chat</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #fff;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+        .recording {
+            animation: pulse 1s infinite;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useRef, useEffect, useCallback } = React;
+
+        function App() {
+            const [messages, setMessages] = useState([]);
+            const [isRecording, setIsRecording] = useState(false);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [status, setStatus] = useState('Connecting...');
+            const [isConnected, setIsConnected] = useState(false);
+            const [backendUrl, setBackendUrl] = useState('');
+
+            const wsRef = useRef(null);
+            const mediaRecorderRef = useRef(null);
+            const audioChunksRef = useRef([]);
+            const chatContainerRef = useRef(null);
+
+            const connectWebSocket = useCallback((wsUrl) => {
+                console.log('Connecting to:', wsUrl);
+
+                wsRef.current = new WebSocket(wsUrl);
+
+                wsRef.current.onopen = () => {
+                    console.log('WebSocket connected');
+                    setIsConnected(true);
+                    setStatus('Ready - Hold button to speak');
+                };
+
+                wsRef.current.onclose = () => {
+                    console.log('WebSocket disconnected');
+                    setIsConnected(false);
+                    setStatus('Disconnected - Reconnecting...');
+                    setTimeout(() => connectWebSocket(wsUrl), 3000);
+                };
+
+                wsRef.current.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    setStatus('Connection error - check console');
+                };
+
+                wsRef.current.onmessage = async (event) => {
+                    const data = JSON.parse(event.data);
+                    console.log('Received:', data.type);
+
+                    switch (data.type) {
+                        case 'status':
+                            setStatus(data.message);
+                            break;
+
+                        case 'transcript':
+                            if (data.text) {
+                                setMessages(prev => [...prev, { role: 'user', content: data.text }]);
+                            }
+                            break;
+
+                        case 'response':
+                            setMessages(prev => [...prev, { role: 'assistant', content: data.text }]);
+                            break;
+
+                        case 'audio':
+                            const audioData = atob(data.audio);
+                            const audioArray = new Uint8Array(audioData.length);
+                            for (let i = 0; i < audioData.length; i++) {
+                                audioArray[i] = audioData.charCodeAt(i);
+                            }
+                            const audioBlob = new Blob([audioArray], { type: 'audio/wav' });
+                            const audioUrl = URL.createObjectURL(audioBlob);
+                            const audio = new Audio(audioUrl);
+                            audio.onended = () => {
+                                URL.revokeObjectURL(audioUrl);
+                                setIsProcessing(false);
+                                setStatus('Ready - Hold button to speak');
+                            };
+                            audio.play().catch(e => {
+                                console.error('Audio play error:', e);
+                                setIsProcessing(false);
+                                setStatus('Ready - Hold button to speak');
+                            });
+                            setStatus('Playing response...');
+                            break;
+
+                        case 'error':
+                            setStatus(`Error: ${data.message}`);
+                            setIsProcessing(false);
+                            break;
+                    }
+                };
+            }, []);
+
+            useEffect(() => {
+                // Try to get backend URL from localStorage or use default
+                const savedUrl = localStorage.getItem('backendUrl');
+                if (savedUrl) {
+                    setBackendUrl(savedUrl);
+                    connectWebSocket(`ws://${savedUrl}/ws/voice`);
+                }
+                return () => {
+                    if (wsRef.current) {
+                        wsRef.current.close();
+                    }
+                };
+            }, []);
+
+            useEffect(() => {
+                if (chatContainerRef.current) {
+                    chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+                }
+            }, [messages]);
+
+            const handleConnect = () => {
+                if (backendUrl) {
+                    localStorage.setItem('backendUrl', backendUrl);
+                    if (wsRef.current) {
+                        wsRef.current.close();
+                    }
+                    connectWebSocket(`ws://${backendUrl}/ws/voice`);
+                }
+            };
+
+            const writeString = (view, offset, string) => {
+                for (let i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            };
+
+            const audioBufferToWav = (buffer) => {
+                const numChannels = 1;
+                const sampleRate = buffer.sampleRate;
+                const format = 1;
+                const bitDepth = 16;
+
+                const data = buffer.getChannelData(0);
+                const dataLength = data.length * (bitDepth / 8);
+                const bufferLength = 44 + dataLength;
+
+                const arrayBuffer = new ArrayBuffer(bufferLength);
+                const view = new DataView(arrayBuffer);
+
+                writeString(view, 0, 'RIFF');
+                view.setUint32(4, 36 + dataLength, true);
+                writeString(view, 8, 'WAVE');
+                writeString(view, 12, 'fmt ');
+                view.setUint32(16, 16, true);
+                view.setUint16(20, format, true);
+                view.setUint16(22, numChannels, true);
+                view.setUint32(24, sampleRate, true);
+                view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
+                view.setUint16(32, numChannels * (bitDepth / 8), true);
+                view.setUint16(34, bitDepth, true);
+                writeString(view, 36, 'data');
+                view.setUint32(40, dataLength, true);
+
+                let offset = 44;
+                for (let i = 0; i < data.length; i++) {
+                    const sample = Math.max(-1, Math.min(1, data[i]));
+                    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+                    offset += 2;
+                }
+
+                return new Blob([arrayBuffer], { type: 'audio/wav' });
+            };
+
+            const blobToBase64 = (blob) => {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => {
+                        const base64 = reader.result.split(',')[1];
+                        resolve(base64);
+                    };
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                });
+            };
+
+            const startRecording = async () => {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorderRef.current = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+                    audioChunksRef.current = [];
+
+                    mediaRecorderRef.current.ondataavailable = (event) => {
+                        if (event.data.size > 0) {
+                            audioChunksRef.current.push(event.data);
+                        }
+                    };
+
+                    mediaRecorderRef.current.onstop = async () => {
+                        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+
+                        const arrayBuffer = await audioBlob.arrayBuffer();
+                        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+                        const wavBlob = audioBufferToWav(audioBuffer);
+                        const base64Audio = await blobToBase64(wavBlob);
+
+                        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                            wsRef.current.send(JSON.stringify({
+                                type: 'audio',
+                                audio: base64Audio
+                            }));
+                            setIsProcessing(true);
+                            setStatus('Processing...');
+                        }
+
+                        stream.getTracks().forEach(track => track.stop());
+                    };
+
+                    mediaRecorderRef.current.start();
+                    setIsRecording(true);
+                    setStatus('Recording... Release to send');
+                } catch (error) {
+                    console.error('Error starting recording:', error);
+                    setStatus('Microphone access denied');
+                }
+            };
+
+            const stopRecording = () => {
+                if (mediaRecorderRef.current && isRecording) {
+                    mediaRecorderRef.current.stop();
+                    setIsRecording(false);
+                }
+            };
+
+            const clearHistory = () => {
+                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                    wsRef.current.send(JSON.stringify({ type: 'clear' }));
+                }
+                setMessages([]);
+            };
+
+            return (
+                <div style={{
+                    minHeight: '100vh',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    padding: '20px'
+                }}>
+                    <div style={{
+                        position: 'fixed',
+                        top: '10px',
+                        right: '10px',
+                        padding: '8px 16px',
+                        borderRadius: '20px',
+                        fontSize: '12px',
+                        background: isConnected ? '#48bb78' : '#e53e3e',
+                        color: '#fff'
+                    }}>
+                        {isConnected ? '● Connected' : '○ Disconnected'}
+                    </div>
+
+                    <h1 style={{ fontSize: '2rem', marginBottom: '20px', textAlign: 'center' }}>
+                        Voice AI Assistant
+                    </h1>
+
+                    <div style={{
+                        display: 'flex',
+                        gap: '8px',
+                        marginBottom: '20px',
+                        flexWrap: 'wrap',
+                        justifyContent: 'center'
+                    }}>
+                        <input
+                            type="text"
+                            placeholder="Backend URL (e.g., 145.236.166.29:17679)"
+                            value={backendUrl}
+                            onChange={(e) => setBackendUrl(e.target.value)}
+                            style={{
+                                padding: '10px 16px',
+                                borderRadius: '8px',
+                                border: '1px solid #4a5568',
+                                background: '#2d3748',
+                                color: '#fff',
+                                width: '300px',
+                                fontSize: '14px'
+                            }}
+                        />
+                        <button
+                            onClick={handleConnect}
+                            style={{
+                                padding: '10px 20px',
+                                borderRadius: '8px',
+                                border: 'none',
+                                background: '#4a90d9',
+                                color: '#fff',
+                                cursor: 'pointer',
+                                fontSize: '14px'
+                            }}
+                        >
+                            Connect
+                        </button>
+                    </div>
+
+                    <div
+                        ref={chatContainerRef}
+                        style={{
+                            width: '100%',
+                            maxWidth: '600px',
+                            flex: 1,
+                            overflowY: 'auto',
+                            marginBottom: '20px',
+                            padding: '20px',
+                            background: 'rgba(255,255,255,0.05)',
+                            borderRadius: '16px',
+                            maxHeight: '60vh'
+                        }}
+                    >
+                        {messages.length === 0 ? (
+                            <div style={{ textAlign: 'center', color: '#a0aec0', padding: '40px' }}>
+                                Hold the button and speak to start a conversation
+                            </div>
+                        ) : (
+                            messages.map((msg, idx) => (
+                                <div
+                                    key={idx}
+                                    style={{
+                                        marginBottom: '16px',
+                                        padding: '12px 16px',
+                                        borderRadius: '12px',
+                                        maxWidth: '80%',
+                                        background: msg.role === 'user' ? '#4a90d9' : '#2d3748',
+                                        marginLeft: msg.role === 'user' ? 'auto' : '0',
+                                        marginRight: msg.role === 'user' ? '0' : 'auto',
+                                    }}
+                                >
+                                    {msg.content}
+                                </div>
+                            ))
+                        )}
+                    </div>
+
+                    <div style={{ textAlign: 'center', color: '#a0aec0', padding: '8px', fontSize: '14px', marginBottom: '16px' }}>
+                        {status}
+                    </div>
+
+                    <div style={{ display: 'flex', gap: '16px', alignItems: 'center', flexWrap: 'wrap', justifyContent: 'center' }}>
+                        <button
+                            className={isRecording ? 'recording' : ''}
+                            style={{
+                                width: '100px',
+                                height: '100px',
+                                borderRadius: '50%',
+                                border: 'none',
+                                cursor: isProcessing || !isConnected ? 'not-allowed' : 'pointer',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                fontSize: '40px',
+                                transition: 'all 0.3s ease',
+                                background: isProcessing ? '#4a5568' : isRecording ? '#e53e3e' : '#48bb78',
+                                boxShadow: isRecording ? '0 0 30px rgba(229, 62, 62, 0.6)' : '0 4px 15px rgba(72, 187, 120, 0.4)',
+                            }}
+                            onMouseDown={startRecording}
+                            onMouseUp={stopRecording}
+                            onMouseLeave={stopRecording}
+                            onTouchStart={startRecording}
+                            onTouchEnd={stopRecording}
+                            disabled={isProcessing || !isConnected}
+                        >
+                            {isProcessing ? '⏳' : isRecording ? '🔴' : '🎤'}
+                        </button>
+
+                        <button
+                            style={{
+                                padding: '12px 24px',
+                                borderRadius: '8px',
+                                border: 'none',
+                                background: '#4a5568',
+                                color: '#fff',
+                                cursor: 'pointer',
+                                fontSize: '14px'
+                            }}
+                            onClick={clearHistory}
+                        >
+                            Clear History
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
