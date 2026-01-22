@@ -41,14 +41,17 @@
             const [isProcessing, setIsProcessing] = useState(false);
             const [status, setStatus] = useState('Connecting...');
             const [isConnected, setIsConnected] = useState(false);
-            const [backendUrl, setBackendUrl] = useState('');
+            const [backendUrl, setBackendUrl] = useState('spartanly-triplex-lorene.ngrok-free.dev');
 
             const wsRef = useRef(null);
             const mediaRecorderRef = useRef(null);
             const audioChunksRef = useRef([]);
             const chatContainerRef = useRef(null);
 
-            const connectWebSocket = useCallback((wsUrl) => {
+            const connectWebSocket = useCallback((host) => {
+                // Use wss:// for ngrok (HTTPS) or ws:// for local
+                const protocol = host.includes('ngrok') || host.includes('https') ? 'wss' : 'ws';
+                const wsUrl = `${protocol}://${host}/ws/voice`;
                 console.log('Connecting to:', wsUrl);
 
                 wsRef.current = new WebSocket(wsUrl);
@@ -63,7 +66,7 @@
                     console.log('WebSocket disconnected');
                     setIsConnected(false);
                     setStatus('Disconnected - Reconnecting...');
-                    setTimeout(() => connectWebSocket(wsUrl), 3000);
+                    setTimeout(() => connectWebSocket(host), 3000);
                 };
 
                 wsRef.current.onerror = (error) => {
@@ -121,12 +124,10 @@
             }, []);
 
             useEffect(() => {
-                // Try to get backend URL from localStorage or use default
-                const savedUrl = localStorage.getItem('backendUrl');
-                if (savedUrl) {
-                    setBackendUrl(savedUrl);
-                    connectWebSocket(`ws://${savedUrl}/ws/voice`);
-                }
+                // Try to get backend URL from localStorage or use default ngrok URL
+                const savedUrl = localStorage.getItem('backendUrl') || 'spartanly-triplex-lorene.ngrok-free.dev';
+                setBackendUrl(savedUrl);
+                connectWebSocket(savedUrl);
                 return () => {
                     if (wsRef.current) {
                         wsRef.current.close();
@@ -146,7 +147,7 @@
                     if (wsRef.current) {
                         wsRef.current.close();
                     }
-                    connectWebSocket(`ws://${backendUrl}/ws/voice`);
+                    connectWebSocket(backendUrl);
                 }
             };
 
@@ -296,7 +297,7 @@
                     }}>
                         <input
                             type="text"
-                            placeholder="Backend URL (e.g., 145.236.166.29:17679)"
+                            placeholder="Backend URL (e.g., spartanly-triplex-lorene.ngrok-free.dev)"
                             value={backendUrl}
                             onChange={(e) => setBackendUrl(e.target.value)}
                             style={{
