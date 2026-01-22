@@ -17,33 +17,46 @@ from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from faster_whisper import WhisperModel
 import httpx
 
-# Global models
-whisper_model = None
+# Global models container (using dict to avoid lifespan global variable issues)
+models = {
+    "whisper": None,
+    "silero": None,
+    "silero_sample_rate": 48000
+}
 
 # AWS Bedrock config
 AWS_BEARER_TOKEN = os.getenv("AWS_BEARER_TOKEN_BEDROCK", "")
 BEDROCK_ENDPOINT = "https://bedrock-runtime.us-east-1.amazonaws.com"
 
-# Fish Speech API config
-FISH_SPEECH_API = "http://127.0.0.1:8001"
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global whisper_model
     print("Loading models...")
 
     # Load Whisper
     print("Loading Faster-Whisper model...")
-    whisper_model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+    models["whisper"] = WhisperModel("large-v3", device="cuda", compute_type="float16")
     print("Whisper loaded!")
 
-    # Fish Speech is loaded separately via its own API server
-    print("Fish Speech TTS available via API at", FISH_SPEECH_API)
+    # Load Silero TTS
+    print("Loading Silero TTS model...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    silero, _ = torch.hub.load(
+        repo_or_dir='snakers4/silero-models',
+        model='silero_tts',
+        language='ru',
+        speaker='v4_ru'
+    )
+    # Note: silero.to() modifies in-place and returns None, so don't reassign
+    silero.to(device)
+    models["silero"] = silero
+    models["silero_sample_rate"] = 48000
+    print(f"Silero TTS loaded on {device}!")
 
     yield
 
     # Cleanup
-    del whisper_model
+    models["whisper"] = None
+    models["silero"] = None
     torch.cuda.empty_cache()
 
 app = FastAPI(title="Voice AI API", lifespan=lifespan)
@@ -65,6 +78,15 @@ async def root():
 async def health():
     return {"status": "ok", "cuda": torch.cuda.is_available()}
 
+@app.get("/debug")
+async def debug():
+    return {
+        "whisper_loaded": models["whisper"] is not None,
+        "silero_loaded": models["silero"] is not None,
+        "silero_type": str(type(models["silero"])),
+        "sample_rate": models["silero_sample_rate"]
+    }
+
 @app.post("/stt")
 async def speech_to_text(audio: UploadFile = File(...)):
     """Convert speech to text using Whisper"""
@@ -74,7 +96,7 @@ async def speech_to_text(audio: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
 
-        segments, info = whisper_model.transcribe(tmp_path, language="ru")
+        segments, info = models["whisper"].transcribe(tmp_path, language="ru")
         text = " ".join([seg.text for seg in segments])
         os.unlink(tmp_path)
 
@@ -129,29 +151,40 @@ async def call_claude(text: str, conversation_history: list = None) -> str:
         result = response.json()
         return result["output"]["message"]["content"][0]["text"]
 
-async def generate_tts(text: str) -> bytes:
-    """Generate speech using Fish Speech API"""
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(
-            f"{FISH_SPEECH_API}/v1/tts",
-            json={
-                "text": text,
-                "format": "wav",
-                "streaming": False,
-                "max_new_tokens": 1024,
-                "top_p": 0.7,
-                "repetition_penalty": 1.2,
-                "temperature": 0.7,
-                "chunk_length": 200,
-            },
-            headers={"Content-Type": "application/json"}
-        )
+def generate_tts(text: str) -> bytes:
+    """Generate speech using Silero TTS with kseniya voice"""
+    silero_model = models["silero"]
+    sample_rate = 48000  # Original quality
 
-        if response.status_code != 200:
-            print(f"Fish Speech API error: {response.status_code} - {response.text}")
-            raise Exception(f"TTS error: {response.status_code}")
+    # Generate audio with Silero
+    audio = silero_model.apply_tts(
+        text=text,
+        speaker='baya',
+        sample_rate=sample_rate,
+        put_accent=True,
+        put_yo=True
+    )
 
-        return response.content
+    # Convert to numpy
+    if isinstance(audio, torch.Tensor):
+        audio_np = audio.cpu().numpy()
+    else:
+        audio_np = np.array(audio)
+
+    # Normalize and convert to int16
+    audio_np = audio_np / np.abs(audio_np).max() * 0.9
+    audio_np = (audio_np * 32767).astype(np.int16)
+
+    # Create WAV bytes
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_np.tobytes())
+
+    buffer.seek(0)
+    return buffer.getvalue()
 
 @app.post("/chat")
 async def chat(request: dict):
@@ -167,16 +200,17 @@ async def chat(request: dict):
 
 @app.post("/tts")
 async def text_to_speech(request: dict):
-    """Convert text to speech using Fish Speech"""
+    """Convert text to speech using Silero TTS"""
     text = request.get("text", "")
 
     if not text:
         raise HTTPException(status_code=400, detail="No text provided")
 
     try:
-        audio_bytes = await generate_tts(text)
+        audio_bytes = generate_tts(text)
         return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/wav")
     except Exception as e:
+        print(f"TTS error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/ws/voice")
@@ -199,7 +233,7 @@ async def voice_websocket(websocket: WebSocket):
 
                 # STT
                 await websocket.send_json({"type": "status", "message": "Transcribing..."})
-                segments, info = whisper_model.transcribe(tmp_path, language="ru")
+                segments, info = models["whisper"].transcribe(tmp_path, language="ru")
                 user_text = " ".join([seg.text for seg in segments]).strip()
                 os.unlink(tmp_path)
 
@@ -220,17 +254,17 @@ async def voice_websocket(websocket: WebSocket):
 
                 await websocket.send_json({"type": "response", "text": ai_response})
 
-                # TTS with Fish Speech
+                # TTS with Silero
                 await websocket.send_json({"type": "status", "message": "Generating speech..."})
 
                 try:
-                    audio_bytes = await generate_tts(ai_response)
+                    audio_bytes = generate_tts(ai_response)
                     audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
 
                     await websocket.send_json({
                         "type": "audio",
                         "audio": audio_base64,
-                        "sample_rate": 44100
+                        "sample_rate": 48000
                     })
                 except Exception as e:
                     print(f"TTS error: {e}")
@@ -243,6 +277,7 @@ async def voice_websocket(websocket: WebSocket):
     except WebSocketDisconnect:
         print("Client disconnected")
     except Exception as e:
+        print(f"WebSocket error: {e}")
         await websocket.send_json({"type": "error", "message": str(e)})
 
 if __name__ == "__main__":
